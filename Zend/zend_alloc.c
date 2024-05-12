@@ -408,6 +408,42 @@ static void stderr_last_error(char *msg)
 }
 #endif
 
+static size_t zend_get_page_size_static(void)
+{
+	static size_t page_size = 0;
+
+	if (!page_size) {
+		page_size = zend_get_page_size();
+		if (!page_size || (page_size & (page_size - 1))) {
+			/* anyway, we have to return a valid result */
+			page_size = 4096;
+		}
+	}
+
+	return page_size;
+}
+
+// Add a guard page after the chunk.
+static void* map_guard(void* pointer, size_t size, size_t page_size) {
+#ifdef ZEND_WIN32
+	DWORD protect;
+
+	if (!VirtualProtect(pointer + size - page_size, page_size, PAGE_READONLY | PAGE_GUARD, &protect)) {
+		DWORD err = GetLastError();
+		char *errmsg = php_win32_error_to_msg(err);
+		zend_error_noreturn(E_ERROR, "Guard page protect failed: VirtualProtect failed: [0x%08lx] %s )",  err, errmsg[0] ? errmsg : "Unknown");
+		php_win32_error_msg_free(errmsg);
+		VirtualFree(pointer, 0, MEM_RELEASE);
+		return NULL;
+	}
+#else
+	if (mprotect(pointer + size - page_size, page_size, PROT_NONE) < 0){
+		zend_error_noreturn(E_ERROR, "Guard page protect failed: mprotect failed: %s (%d)", strerror(errno), errno);
+	}
+	return pointer;
+#endif
+}
+
 /*****************/
 /* OS Allocation */
 /*****************/
@@ -1413,7 +1449,10 @@ static zend_always_inline void *zend_mm_alloc_heap(zend_mm_heap *heap, size_t si
 #if ZEND_DEBUG
 		size = real_size;
 #endif
-		return zend_mm_alloc_huge(heap, size ZEND_FILE_LINE_RELAY_CC ZEND_FILE_LINE_ORIG_RELAY_CC);
+		size_t page_size = zend_get_page_size_static();
+		size_t full_size = size + (page_size - size % page_size) + page_size;
+		ptr = zend_mm_alloc_huge(heap, full_size ZEND_FILE_LINE_RELAY_CC ZEND_FILE_LINE_ORIG_RELAY_CC);
+		return map_guard(ptr, full_size, page_size);
 	}
 }
 
@@ -1823,7 +1862,9 @@ static void *zend_mm_alloc_huge(zend_mm_heap *heap, size_t size ZEND_FILE_LINE_D
 #else
 	size_t alignment = REAL_PAGE_SIZE;
 #endif
-	size_t new_size = ZEND_MM_ALIGNED_SIZE_EX(size, alignment);
+	size_t page_size = zend_get_page_size_static();
+	size_t new_size = size + (page_size - size % page_size) + page_size;
+	size = new_size;
 	void *ptr;
 
 	if (UNEXPECTED(new_size < size)) {
@@ -1861,6 +1902,9 @@ static void *zend_mm_alloc_huge(zend_mm_heap *heap, size_t size ZEND_FILE_LINE_D
 			return NULL;
 		}
 	}
+	map_guard(ptr, size, page_size);
+	size -= page_size;
+
 #if ZEND_DEBUG
 	zend_mm_add_huge_block(heap, ptr, new_size, size ZEND_FILE_LINE_RELAY_CC ZEND_FILE_LINE_ORIG_RELAY_CC);
 #else
@@ -1888,10 +1932,11 @@ static void *zend_mm_alloc_huge(zend_mm_heap *heap, size_t size ZEND_FILE_LINE_D
 static void zend_mm_free_huge(zend_mm_heap *heap, void *ptr ZEND_FILE_LINE_DC ZEND_FILE_LINE_ORIG_DC)
 {
 	size_t size;
+	size_t page_size = zend_get_page_size();
 
 	ZEND_MM_CHECK(ZEND_MM_ALIGNED_OFFSET(ptr, ZEND_MM_CHUNK_SIZE) == 0, "zend_mm_heap corrupted");
 	size = zend_mm_del_huge_block(heap, ptr ZEND_FILE_LINE_RELAY_CC ZEND_FILE_LINE_ORIG_RELAY_CC);
-	zend_mm_chunk_free(heap, ptr, size);
+	zend_mm_chunk_free(heap, ptr, size + page_size);
 #if ZEND_MM_STAT || ZEND_MM_LIMIT
 	heap->real_size -= size;
 #endif
