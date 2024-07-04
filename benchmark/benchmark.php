@@ -2,6 +2,10 @@
 
 require_once __DIR__ . '/shared.php';
 
+if (!extension_loaded('gmp')) {
+    throw new LogicException('Extension gmp is required.');
+}
+
 $storeResult = ($argv[1] ?? 'false') === 'true';
 $phpCgi = $argv[2] ?? dirname(PHP_BINARY) . '/php-cgi';
 if (!file_exists($phpCgi)) {
